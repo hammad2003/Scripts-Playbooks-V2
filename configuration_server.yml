@@ -1,0 +1,151 @@
+---
+- name: Configurar sudoers con Ansible
+  hosts: servidor
+  remote_user: usuario
+  become: yes
+  tasks:
+    - name: Añadir permisos para usuario en sudoers
+      become: yes
+      lineinfile:
+        dest: /etc/sudoers
+        insertafter: 'root\tALL=(ALL:ALL) ALL'
+        line: 'usuario ALL=(ALL) NOPASSWD: ALL'
+        validate: 'visudo -cf %s'
+
+    - name: Añadir permisos para grupo sudo en sudoers
+      become: yes
+      lineinfile:
+        dest: /etc/sudoers
+        insertafter: '%sudo   ALL=(ALL:ALL) ALL'
+        line: '%sudo   ALL=(ALL) NOPASSWD: ALL'
+        validate: 'visudo -cf %s'
+
+
+    - name: Actualizar lista de paquetes
+      apt:
+        update_cache: yes
+
+    - name: Instalar paquetes necesarios
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - docker.io
+        - git
+        - npm
+        - python3-pip
+        - curl
+        - postgresql
+
+    - name: Crear base de datos y usuario
+      shell: |
+        sudo -u postgres psql -c "CREATE DATABASE smai;"
+        sudo -u postgres psql -c "CREATE ROLE usuario WITH LOGIN PASSWORD 'usuario';"
+        sudo -u postgres psql -d smai -c "GRANT ALL PRIVILEGES ON DATABASE smai TO usuario;"
+      become: yes
+
+    - name: Crear tipos y tablas
+      shell: |
+        sudo -u postgres psql -d smai -c "
+        CREATE TYPE difficulty_enum AS ENUM ('hard', 'normal', 'easy', 'peaceful');
+        CREATE TYPE mode_enum AS ENUM ('creative', 'survival', 'adventure', 'spectator');
+        
+        CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          username VARCHAR(50) UNIQUE NOT NULL,
+          email VARCHAR(100) UNIQUE NOT NULL,
+          password VARCHAR(255) NOT NULL,
+          token TEXT NOT NULL,
+          jwt TEXT NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          servers_created INT DEFAULT 0
+        );
+        
+        CREATE TABLE IF NOT EXISTS wireguard_configs (
+          id SERIAL PRIMARY KEY,
+          user_id INT REFERENCES users(id) ON DELETE CASCADE,
+          wireguard_conf TEXT NOT NULL,
+          wireguard_public_key VARCHAR(255) NOT NULL,
+          wireguard_private_key VARCHAR(255) NOT NULL,
+          wireguard_ip VARCHAR(15) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS servers (
+          id SERIAL PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          software VARCHAR(50) NOT NULL,
+          version VARCHAR(20) NOT NULL,
+          curseforge_modpack_url VARCHAR(500),
+          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+          container_id VARCHAR(255),
+          status VARCHAR(20) DEFAULT 'stopped',
+          ip_address VARCHAR(255),
+          port INTEGER,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        );
+        
+        CREATE TABLE IF NOT EXISTS server_properties (
+          id SERIAL PRIMARY KEY,
+          server_id INT REFERENCES servers(id) ON DELETE CASCADE,
+          difficulty difficulty_enum DEFAULT 'easy',
+          mode mode_enum DEFAULT 'survival',
+          max_players INT DEFAULT 20,
+          max_build_height INT DEFAULT 256,
+          view_distance INT DEFAULT 10,
+          spawn_npcs BOOLEAN DEFAULT TRUE,
+          allow_nether BOOLEAN DEFAULT TRUE,
+          spawn_animals BOOLEAN DEFAULT TRUE,
+          spawn_monsters BOOLEAN DEFAULT TRUE,
+          pvp BOOLEAN DEFAULT TRUE,
+          enable_command_block BOOLEAN DEFAULT FALSE,
+          allow_flight BOOLEAN DEFAULT FALSE
+        );
+        
+        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO usuario;
+        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO usuario;"
+      become: yes
+
+    - name: Descargar e instalar Python
+      shell: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh
+      become: yes
+
+    - name: Descargar e instalar Python
+      shell: bash -c export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" && nvm install 18 && nvm use 18
+      become: yes
+
+    - name: Descargar imagen de Docker
+      shell: docker pull itzg/minecraft-server
+      become: yes
+
+    - name: Clonar repositorio de HTML
+      git:
+        repo: https://github.com/McMiguel2004/smaiV2
+        dest: /home/usuario/
+        force: yes
+      become: yes
+
+    - name: Cambiar propietario y grupo de /var/www/html/mods
+      file:
+        path: /home/usuario/smaiV2
+        owner: usuario
+        group: usuario
+        recurse: yes
+        mode: "0775"
+      become: yes
+
+    - name: Preparando el BACKEND
+      shell: cd /home/usuario/smaiV2/backend && pip install -r requirements.txt
+      become: yes
+
+    - name: Preparando el FRONTEND
+      shell: cd /home/usuario/smaiV2/frontend && npm install
+      become: yes
+
+    - name: Levantando el BACKEND
+      shell: cd /home/usuario/smaiV2/backend && python3 app.py
+      become: yes
+
+    - name: Levantando el FRONTEND
+      shell: cd /home/usuario/smaiV2/frontend && npm run dev -- --host
+      become: yes

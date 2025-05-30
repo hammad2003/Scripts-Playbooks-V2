@@ -1,0 +1,31 @@
+---
+- name: Minecraft
+  hosts: clientes
+  remote_user: usuario
+  tasks:
+    - name: Actualizar lista de paquetes
+      apt:
+        update_cache: yes
+      become: yes
+
+    - name: Instalar paquetes necesarios
+      apt:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - openjdk-18-jre
+        - openjdk-18-jdk
+        - wget
+        - unzip
+      become: yes
+
+    - name: Descargar e instalar TLauncher
+      shell: |
+        mkdir -p /home/usuario/smai/launcher
+        cd /home/usuario/smai/launcher
+        wget -O jar https://tlauncher.org/jar
+        unzip jar
+        mv TLauncher.v10/* .
+        rm -r TLauncher.v10
+        rm jar
+      become: no
