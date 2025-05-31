@@ -1,151 +1,379 @@
 ---
-- name: Configurar sudoers con Ansible
+- name: Configurar Servidor SMAI
   hosts: servidor
   remote_user: usuario
   become: yes
+  vars:
+    db_name: smai
+    db_user: usuario
+    db_password: usuario
+    project_dir: /home/usuario/smaiV2
+    github_repo: https://github.com/McMiguel2004/smaiV2.git
+  
   tasks:
+    - name: Verificar conectividad
+      ping:
+      
     - name: Añadir permisos para usuario en sudoers
-      become: yes
       lineinfile:
         dest: /etc/sudoers
         insertafter: 'root\tALL=(ALL:ALL) ALL'
         line: 'usuario ALL=(ALL) NOPASSWD: ALL'
         validate: 'visudo -cf %s'
+      ignore_errors: yes
 
     - name: Añadir permisos para grupo sudo en sudoers
-      become: yes
       lineinfile:
         dest: /etc/sudoers
         insertafter: '%sudo   ALL=(ALL:ALL) ALL'
         line: '%sudo   ALL=(ALL) NOPASSWD: ALL'
         validate: 'visudo -cf %s'
-
+      ignore_errors: yes
 
     - name: Actualizar lista de paquetes
       apt:
         update_cache: yes
+        cache_valid_time: 3600
 
-    - name: Instalar paquetes necesarios
+    - name: Instalar paquetes del sistema
       apt:
         name: "{{ item }}"
         state: present
       loop:
         - docker.io
         - git
-        - npm
         - python3-pip
         - curl
         - postgresql
+        - postgresql-contrib
+        - python3-psycopg2
+        - build-essential
+        - python3-dev
+      ignore_errors: yes
 
-    - name: Crear base de datos y usuario
+    - name: Instalar Docker SDK para Python
+      pip:
+        name: docker
+        executable: pip3
+        state: present
+      ignore_errors: yes
+
+    - name: Iniciar y habilitar servicios
+      systemd:
+        name: "{{ item }}"
+        state: started
+        enabled: yes
+      loop:
+        - docker
+        - postgresql
+      ignore_errors: yes
+
+    - name: Agregar usuario al grupo docker
+      user:
+        name: usuario
+        groups: docker
+        append: yes
+
+    - name: Verificar si la base de datos existe
+      become_user: postgres
+      postgresql_query:
+        db: postgres
+        query: "SELECT 1 FROM pg_database WHERE datname='{{ db_name }}'"
+      register: db_exists
+      ignore_errors: yes
+
+    - name: Eliminar base de datos existente si existe
+      become_user: postgres
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: absent
+      when: db_exists.rowcount is defined and db_exists.rowcount > 0
+      ignore_errors: yes
+
+    - name: Crear base de datos
+      become_user: postgres
+      postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+
+    - name: Verificar si el usuario de base de datos existe
+      become_user: postgres
+      postgresql_query:
+        db: postgres
+        query: "SELECT 1 FROM pg_roles WHERE rolname='{{ db_user }}'"
+      register: user_exists
+      ignore_errors: yes
+
+    - name: Eliminar usuario existente si existe
+      become_user: postgres
+      postgresql_user:
+        name: "{{ db_user }}"
+        state: absent
+      when: user_exists.rowcount is defined and user_exists.rowcount > 0
+      ignore_errors: yes
+
+    - name: Crear usuario de base de datos
+      become_user: postgres
+      postgresql_user:
+        name: "{{ db_user }}"
+        password: "{{ db_password }}"
+        state: present
+
+    - name: Otorgar privilegios al usuario
+      become_user: postgres
+      postgresql_privs:
+        db: "{{ db_name }}"
+        privs: ALL
+        type: database
+        obj: "{{ db_name }}"
+        role: "{{ db_user }}"
+
+    - name: Verificar si los tipos ENUM ya existen
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          SELECT typname FROM pg_type WHERE typname IN ('difficulty_enum', 'mode_enum');
+      register: existing_types
+      ignore_errors: yes
+
+    - name: Crear tipo ENUM difficulty_enum
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: "CREATE TYPE difficulty_enum AS ENUM ('hard', 'normal', 'easy', 'peaceful');"
+      when: existing_types.rowcount is not defined or 'difficulty_enum' not in (existing_types.query_result | map(attribute='typname') | list)
+      ignore_errors: yes
+
+    - name: Crear tipo ENUM mode_enum
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: "CREATE TYPE mode_enum AS ENUM ('creative', 'survival', 'adventure', 'spectator');"
+      when: existing_types.rowcount is not defined or 'mode_enum' not in (existing_types.query_result | map(attribute='typname') | list)
+      ignore_errors: yes
+
+    - name: Crear tabla users
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS users (
+            id SERIAL PRIMARY KEY,
+            username VARCHAR(50) UNIQUE NOT NULL,
+            email VARCHAR(100) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            token TEXT NOT NULL,
+            jwt TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            servers_created INT DEFAULT 0
+          );
+
+    - name: Crear tabla wireguard_configs
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS wireguard_configs (
+            id SERIAL PRIMARY KEY,
+            user_id INT REFERENCES users(id) ON DELETE CASCADE,
+            wireguard_conf TEXT NOT NULL,
+            wireguard_public_key VARCHAR(255) NOT NULL,
+            wireguard_private_key VARCHAR(255) NOT NULL,
+            wireguard_ip VARCHAR(15) NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+
+    - name: Crear tabla servers
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS servers (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR(255) NOT NULL,
+            software VARCHAR(50) NOT NULL,
+            version VARCHAR(20) NOT NULL,
+            curseforge_modpack_url VARCHAR(500),
+            user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+            container_id VARCHAR(255),
+            status VARCHAR(20) DEFAULT 'stopped',
+            ip_address VARCHAR(255),
+            port INTEGER,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+          );
+
+    - name: Crear tabla server_properties
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          CREATE TABLE IF NOT EXISTS server_properties (
+            id SERIAL PRIMARY KEY,
+            server_id INT REFERENCES servers(id) ON DELETE CASCADE,
+            difficulty difficulty_enum DEFAULT 'easy',
+            mode mode_enum DEFAULT 'survival',
+            max_players INT DEFAULT 20,
+            max_build_height INT DEFAULT 256,
+            view_distance INT DEFAULT 10,
+            spawn_npcs BOOLEAN DEFAULT TRUE,
+            allow_nether BOOLEAN DEFAULT TRUE,
+            spawn_animals BOOLEAN DEFAULT TRUE,
+            spawn_monsters BOOLEAN DEFAULT TRUE,
+            pvp BOOLEAN DEFAULT TRUE,
+            enable_command_block BOOLEAN DEFAULT FALSE,
+            allow_flight BOOLEAN DEFAULT FALSE
+          );
+
+    - name: Otorgar privilegios en tablas al usuario
+      become_user: postgres
+      postgresql_query:
+        db: "{{ db_name }}"
+        query: |
+          GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO {{ db_user }};
+          GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO {{ db_user }};
+
+    - name: Detener servicios SMAI si están en ejecución
+      systemd:
+        name: "{{ item }}"
+        state: stopped
+      loop:
+        - smai-backend
+        - smai-frontend
+      ignore_errors: yes
+
+    - name: Instalar NVM
+      become_user: usuario
       shell: |
-        sudo -u postgres psql -c "CREATE DATABASE smai;"
-        sudo -u postgres psql -c "CREATE ROLE usuario WITH LOGIN PASSWORD 'usuario';"
-        sudo -u postgres psql -d smai -c "GRANT ALL PRIVILEGES ON DATABASE smai TO usuario;"
-      become: yes
+        curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh | bash
+      args:
+        creates: /home/usuario/.nvm/nvm.sh
 
-    - name: Crear tipos y tablas
+    - name: Instalar Node.js 18 via NVM
+      become_user: usuario
       shell: |
-        sudo -u postgres psql -d smai -c "
-        CREATE TYPE difficulty_enum AS ENUM ('hard', 'normal', 'easy', 'peaceful');
-        CREATE TYPE mode_enum AS ENUM ('creative', 'survival', 'adventure', 'spectator');
-        
-        CREATE TABLE IF NOT EXISTS users (
-          id SERIAL PRIMARY KEY,
-          username VARCHAR(50) UNIQUE NOT NULL,
-          email VARCHAR(100) UNIQUE NOT NULL,
-          password VARCHAR(255) NOT NULL,
-          token TEXT NOT NULL,
-          jwt TEXT NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-          servers_created INT DEFAULT 0
-        );
-        
-        CREATE TABLE IF NOT EXISTS wireguard_configs (
-          id SERIAL PRIMARY KEY,
-          user_id INT REFERENCES users(id) ON DELETE CASCADE,
-          wireguard_conf TEXT NOT NULL,
-          wireguard_public_key VARCHAR(255) NOT NULL,
-          wireguard_private_key VARCHAR(255) NOT NULL,
-          wireguard_ip VARCHAR(15) NOT NULL,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE TABLE IF NOT EXISTS servers (
-          id SERIAL PRIMARY KEY,
-          name VARCHAR(255) NOT NULL,
-          software VARCHAR(50) NOT NULL,
-          version VARCHAR(20) NOT NULL,
-          curseforge_modpack_url VARCHAR(500),
-          user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-          container_id VARCHAR(255),
-          status VARCHAR(20) DEFAULT 'stopped',
-          ip_address VARCHAR(255),
-          port INTEGER,
-          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-        
-        CREATE TABLE IF NOT EXISTS server_properties (
-          id SERIAL PRIMARY KEY,
-          server_id INT REFERENCES servers(id) ON DELETE CASCADE,
-          difficulty difficulty_enum DEFAULT 'easy',
-          mode mode_enum DEFAULT 'survival',
-          max_players INT DEFAULT 20,
-          max_build_height INT DEFAULT 256,
-          view_distance INT DEFAULT 10,
-          spawn_npcs BOOLEAN DEFAULT TRUE,
-          allow_nether BOOLEAN DEFAULT TRUE,
-          spawn_animals BOOLEAN DEFAULT TRUE,
-          spawn_monsters BOOLEAN DEFAULT TRUE,
-          pvp BOOLEAN DEFAULT TRUE,
-          enable_command_block BOOLEAN DEFAULT FALSE,
-          allow_flight BOOLEAN DEFAULT FALSE
-        );
-        
-        GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO usuario;
-        GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO usuario;"
-      become: yes
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        nvm install 18
+        nvm use 18
+        nvm alias default 18
+      args:
+        executable: /bin/bash
 
-    - name: Descargar e instalar Python
-      shell: curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.0/install.sh
-      become: yes
-
-    - name: Descargar e instalar Python
-      shell: bash -c export NVM_DIR="$HOME/.nvm" && [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh" && nvm install 18 && nvm use 18
-      become: yes
-
-    - name: Descargar imagen de Docker
+    - name: Descargar imagen de Docker para Minecraft
       shell: docker pull itzg/minecraft-server
       become: yes
+      ignore_errors: yes
 
-    - name: Clonar repositorio de HTML
-      git:
-        repo: https://github.com/McMiguel2004/smaiV2
-        dest: /home/usuario/
-        force: yes
-      become: yes
-
-    - name: Cambiar propietario y grupo de /var/www/html/mods
+    - name: Eliminar directorio existente del proyecto
       file:
-        path: /home/usuario/smaiV2
+        path: "{{ project_dir }}"
+        state: absent
+      ignore_errors: yes
+
+    - name: Clonar repositorio del proyecto
+      git:
+        repo: "{{ github_repo }}"
+        dest: "{{ project_dir }}"
+        force: yes
+      become_user: usuario
+
+    - name: Cambiar propietario del directorio del proyecto
+      file:
+        path: "{{ project_dir }}"
         owner: usuario
         group: usuario
         recurse: yes
         mode: "0775"
-      become: yes
 
-    - name: Preparando el BACKEND
-      shell: cd /home/usuario/smaiV2/backend && pip install -r requirements.txt
-      become: yes
+    - name: Instalar dependencias de Python para el backend
+      pip:
+        requirements: "{{ project_dir }}/backend/requirements.txt"
+        executable: pip3
+      become_user: usuario
+      ignore_errors: yes
 
-    - name: Preparando el FRONTEND
-      shell: cd /home/usuario/smaiV2/frontend && npm install
-      become: yes
+    - name: Instalar dependencias de Node.js para el frontend
+      become_user: usuario
+      shell: |
+        export NVM_DIR="$HOME/.nvm"
+        [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"
+        cd {{ project_dir }}/frontend
+        npm install
+      args:
+        executable: /bin/bash
+      ignore_errors: yes
 
-    - name: Levantando el BACKEND
-      shell: cd /home/usuario/smaiV2/backend && python3 app.py
-      become: yes
+    - name: Crear archivo de servicio para el backend
+      copy:
+        content: |
+          [Unit]
+          Description=SMAI Backend
+          After=network.target postgresql.service
+          
+          [Service]
+          Type=simple
+          User=usuario
+          WorkingDirectory={{ project_dir }}/backend
+          ExecStart=/usr/bin/python3 app.py
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/smai-backend.service
+        mode: '0644'
 
-    - name: Levantando el FRONTEND
-      shell: cd /home/usuario/smaiV2/frontend && npm run dev -- --host
-      become: yes
+    - name: Crear archivo de servicio para el frontend
+      copy:
+        content: |
+          [Unit]
+          Description=SMAI Frontend
+          After=network.target
+          
+          [Service]
+          Type=simple
+          User=usuario
+          WorkingDirectory={{ project_dir }}/frontend
+          ExecStart=/bin/bash -c 'export NVM_DIR="$HOME/.nvm"; [ -s "$NVM_DIR/nvm.sh" ] && \. "$NVM_DIR/nvm.sh"; npm run dev -- --host'
+          Restart=always
+          RestartSec=10
+          
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/smai-frontend.service
+        mode: '0644'
+
+    - name: Recargar systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Habilitar servicios SMAI
+      systemd:
+        name: "{{ item }}"
+        enabled: yes
+      loop:
+        - smai-backend
+        - smai-frontend
+
+    - name: Iniciar servicios SMAI
+      systemd:
+        name: "{{ item }}"
+        state: started
+      loop:
+        - smai-backend
+        - smai-frontend
+
+    - name: Mostrar información del servidor
+      debug:
+        msg: |
+          ================================
+          SMAI Server instalado exitosamente!
+          ================================
+          Frontend: http://{{ ansible_default_ipv4.address }}:5173
+          Backend: http://{{ ansible_default_ipv4.address }}:5000
+          
+          Para verificar el estado de los servicios:
+          sudo systemctl status smai-backend
+          sudo systemctl status smai-frontend
+          ================================

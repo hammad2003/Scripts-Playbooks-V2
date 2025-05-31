@@ -1,31 +1,145 @@
 ---
-- name: Minecraft
+- name: Configurar Cliente SMAI (TLauncher)
   hosts: clientes
   remote_user: usuario
+  become: yes
+  vars:
+    launcher_dir: /home/usuario/smai/launcher
+    
   tasks:
+    - name: Verificar conectividad
+      ping:
+      
     - name: Actualizar lista de paquetes
       apt:
         update_cache: yes
-      become: yes
+        cache_valid_time: 3600
 
-    - name: Instalar paquetes necesarios
+    - name: Verificar si Java ya está instalado
+      command: java -version
+      register: java_check
+      ignore_errors: yes
+      changed_when: false
+
+    - name: Instalar Java y herramientas necesarias
       apt:
         name: "{{ item }}"
         state: present
       loop:
-        - openjdk-18-jre
-        - openjdk-18-jdk
+        - openjdk-17-jre
+        - openjdk-17-jdk
         - wget
         - unzip
-      become: yes
+        - curl
+      when: java_check.rc != 0 or java_check is failed
 
-    - name: Descargar e instalar TLauncher
+    - name: Crear directorio para el launcher
+      file:
+        path: "{{ launcher_dir }}"
+        state: directory
+        owner: usuario
+        group: usuario
+        mode: '0755'
+      become_user: usuario
+
+    - name: Verificar si TLauncher ya está descargado
+      stat:
+        path: "{{ launcher_dir }}/TLauncher.jar"
+      register: tlauncher_exists
+
+    - name: Descargar TLauncher
+      get_url:
+        url: https://tlauncher.org/jar
+        dest: "{{ launcher_dir }}/tlauncher.zip"
+        owner: usuario
+        group: usuario
+        mode: '0644'
+      when: not tlauncher_exists.stat.exists
+      become_user: usuario
+
+    - name: Extraer TLauncher
+      unarchive:
+        src: "{{ launcher_dir }}/tlauncher.zip"
+        dest: "{{ launcher_dir }}"
+        owner: usuario
+        group: usuario
+        remote_src: yes
+      when: not tlauncher_exists.stat.exists
+      become_user: usuario
+
+    - name: Buscar y mover archivos de TLauncher
       shell: |
-        mkdir -p /home/usuario/smai/launcher
-        cd /home/usuario/smai/launcher
-        wget -O jar https://tlauncher.org/jar
-        unzip jar
-        mv TLauncher.v10/* .
-        rm -r TLauncher.v10
-        rm jar
-      become: no
+        cd {{ launcher_dir }}
+        if [ -d "TLauncher.v10" ]; then
+          mv TLauncher.v10/* .
+          rm -rf TLauncher.v10
+        fi
+        if [ -f "tlauncher.zip" ]; then
+          rm tlauncher.zip
+        fi
+        # Buscar el archivo JAR principal
+        find . -name "*.jar" -type f | head -1 | xargs -I {} mv {} TLauncher.jar
+      when: not tlauncher_exists.stat.exists
+      become_user: usuario
+      ignore_errors: yes
+
+    - name: Crear script de lanzamiento
+      copy:
+        content: |
+          #!/bin/bash
+          cd {{ launcher_dir }}
+          java -jar TLauncher.jar
+        dest: "{{ launcher_dir }}/launch.sh"
+        owner: usuario
+        group: usuario
+        mode: '0755'
+
+    - name: Crear acceso directo en el escritorio
+      copy:
+        content: |
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=TLauncher
+          Comment=Minecraft Launcher
+          Exec={{ launcher_dir }}/launch.sh
+          Icon={{ launcher_dir }}/icon.png
+          Terminal=false
+          StartupNotify=true
+          Categories=Game;
+        dest: /home/usuario/Desktop/TLauncher.desktop
+        owner: usuario
+        group: usuario
+        mode: '0755'
+      ignore_errors: yes
+
+    - name: Verificar instalación
+      stat:
+        path: "{{ launcher_dir }}/TLauncher.jar"
+      register: final_check
+
+    - name: Mostrar información de instalación
+      debug:
+        msg: |
+          ================================
+          TLauncher instalado exitosamente!
+          ================================
+          Ubicación: {{ launcher_dir }}
+          
+          Para ejecutar TLauncher:
+          cd {{ launcher_dir }}
+          ./launch.sh
+          
+          O usar el acceso directo del escritorio
+          ================================
+      when: final_check.stat.exists
+
+    - name: Mostrar error si la instalación falló
+      debug:
+        msg: |
+          ================================
+          Error en la instalación de TLauncher
+          ================================
+          Verifica manualmente en {{ launcher_dir }}
+          ================================
+      when: not final_check.stat.exists
