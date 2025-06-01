@@ -13,7 +13,7 @@ Este repositorio contiene scripts de Ansible que automatizan completamente la in
 - ✅ **Base de datos PostgreSQL**
 - ✅ **Docker** para servidores de Minecraft
 - ✅ **Servicios systemd** para auto-inicio
-- ✅ **Cliente TLauncher** (opcional)
+- ✅ **Cliente TLauncher y Curseforge** (opcional)
 
 ## 🎯 Características
 

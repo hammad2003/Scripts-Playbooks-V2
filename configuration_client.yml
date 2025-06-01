@@ -1,10 +1,11 @@
 ---
-- name: Configurar Cliente SMAI (TLauncher)
+- name: Configurar Cliente SMAI (TLauncher + CurseForge)
   hosts: clientes
   remote_user: usuario
   become: yes
   vars:
     launcher_dir: /home/usuario/smai/launcher
+    curseforge_dir: /home/usuario/smai/curseforge
     
   tasks:
     - name: Verificar conectividad
@@ -31,9 +32,49 @@
         - wget
         - unzip
         - curl
+        - fuse
+        - fuse3
+        - libfuse2
+        - libfuse3-3
       when: java_check.rc != 0 or java_check is failed
 
-    - name: Crear directorio para el launcher
+    - name: Configurar permisos de FUSE
+      shell: |
+        # Añadir usuario al grupo fuse si existe
+        if getent group fuse > /dev/null 2>&1; then
+          usermod -a -G fuse usuario
+        fi
+        # Configurar permisos de /dev/fuse
+        if [ -e /dev/fuse ]; then
+          chmod 666 /dev/fuse
+        fi
+        # Cargar módulo fuse si no está cargado
+        modprobe fuse || true
+      ignore_errors: yes
+
+    # ================================
+    # CREAR DIRECTORIOS NECESARIOS
+    # ================================
+    
+    - name: Crear directorio principal SMAI
+      file:
+        path: /home/usuario/smai
+        state: directory
+        owner: usuario
+        group: usuario
+        mode: '0755'
+      become_user: usuario
+
+    - name: Crear directorio Desktop si no existe
+      file:
+        path: /home/usuario/Desktop
+        state: directory
+        owner: usuario
+        group: usuario
+        mode: '0755'
+      become_user: usuario
+
+    - name: Crear directorio para TLauncher
       file:
         path: "{{ launcher_dir }}"
         state: directory
@@ -42,6 +83,19 @@
         mode: '0755'
       become_user: usuario
 
+    - name: Crear directorio para CurseForge
+      file:
+        path: "{{ curseforge_dir }}"
+        state: directory
+        owner: usuario
+        group: usuario
+        mode: '0755'
+      become_user: usuario
+
+    # ================================
+    # INSTALACIÓN DE TLAUNCHER
+    # ================================
+    
     - name: Verificar si TLauncher ya está descargado
       stat:
         path: "{{ launcher_dir }}/TLauncher.jar"
@@ -54,8 +108,18 @@
         owner: usuario
         group: usuario
         mode: '0644'
+        timeout: 60
       when: not tlauncher_exists.stat.exists
       become_user: usuario
+      register: tlauncher_download
+      ignore_errors: yes
+
+    - name: Verificar descarga de TLauncher
+      fail:
+        msg: "Error al descargar TLauncher"
+      when: 
+        - not tlauncher_exists.stat.exists
+        - tlauncher_download is failed
 
     - name: Extraer TLauncher
       unarchive:
@@ -64,37 +128,219 @@
         owner: usuario
         group: usuario
         remote_src: yes
-      when: not tlauncher_exists.stat.exists
+      when: 
+        - not tlauncher_exists.stat.exists
+        - tlauncher_download is succeeded
       become_user: usuario
 
-    - name: Buscar y mover archivos de TLauncher
+    - name: Procesar archivos de TLauncher (mejorado)
       shell: |
         cd {{ launcher_dir }}
-        if [ -d "TLauncher.v10" ]; then
-          mv TLauncher.v10/* .
-          rm -rf TLauncher.v10
+        
+        # Solo procesar si no existe TLauncher.jar
+        if [ ! -f "TLauncher.jar" ]; then
+          echo "Procesando archivos de TLauncher..."
+          
+          # Mover contenido de directorio TLauncher.v10 si existe
+          if [ -d "TLauncher.v10" ]; then
+            echo "Moviendo archivos de TLauncher.v10..."
+            mv TLauncher.v10/* . 2>/dev/null || true
+            rm -rf TLauncher.v10
+          fi
+          
+          # Buscar archivo JAR principal y renombrarlo
+          JAR_FILE=$(find . -name "*.jar" -type f | grep -v TLauncher.jar | head -1)
+          if [ -n "$JAR_FILE" ] && [ "$JAR_FILE" != "./TLauncher.jar" ]; then
+            echo "Renombrando $JAR_FILE a TLauncher.jar"
+            mv "$JAR_FILE" TLauncher.jar
+          fi
+        else
+          echo "TLauncher.jar ya existe, omitiendo procesamiento"
         fi
-        if [ -f "tlauncher.zip" ]; then
-          rm tlauncher.zip
-        fi
-        # Buscar el archivo JAR principal
-        find . -name "*.jar" -type f | head -1 | xargs -I {} mv {} TLauncher.jar
-      when: not tlauncher_exists.stat.exists
+        
+        # Limpiar archivo ZIP
+        rm -f tlauncher.zip
+        
+        echo "Procesamiento completado"
+      when: 
+        - not tlauncher_exists.stat.exists
+        - tlauncher_download is succeeded
       become_user: usuario
-      ignore_errors: yes
+      register: tlauncher_process
+      changed_when: "'Procesando archivos' in tlauncher_process.stdout"
 
-    - name: Crear script de lanzamiento
+    - name: Crear script de lanzamiento para TLauncher
       copy:
         content: |
           #!/bin/bash
           cd {{ launcher_dir }}
+          
+          if [ ! -f "TLauncher.jar" ]; then
+            echo "❌ TLauncher.jar no encontrado"
+            echo "Ubicación esperada: {{ launcher_dir }}/TLauncher.jar"
+            read -p "Presiona Enter para continuar..."
+            exit 1
+          fi
+          
+          echo "🚀 Iniciando TLauncher..."
           java -jar TLauncher.jar
-        dest: "{{ launcher_dir }}/launch.sh"
+        dest: "{{ launcher_dir }}/launch_tlauncher.sh"
         owner: usuario
         group: usuario
         mode: '0755'
 
-    - name: Crear acceso directo en el escritorio
+    # ================================
+    # INSTALACIÓN DE CURSEFORGE
+    # ================================
+    
+    - name: Verificar si CurseForge ya está descargado
+      stat:
+        path: "{{ curseforge_dir }}/CurseForge.AppImage"
+      register: curseforge_exists
+
+    - name: Descargar CurseForge para Linux (método principal)
+      get_url:
+        url: https://curseforge.overwolf.com/downloads/curseforge-latest-linux.zip
+        dest: "{{ curseforge_dir }}/curseforge-linux.zip"
+        owner: usuario
+        group: usuario
+        mode: '0644'
+        timeout: 120
+      when: not curseforge_exists.stat.exists
+      become_user: usuario
+      register: curseforge_download_main
+
+    - name: Extraer CurseForge del ZIP oficial
+      unarchive:
+        src: "{{ curseforge_dir }}/curseforge-linux.zip"
+        dest: "{{ curseforge_dir }}"
+        owner: usuario
+        group: usuario
+        remote_src: yes
+      when: 
+        - not curseforge_exists.stat.exists
+        - curseforge_download_main is succeeded
+      become_user: usuario
+
+    - name: Procesar archivos de CurseForge (mejorado)
+      shell: |
+        cd {{ curseforge_dir }}
+        
+        # Solo procesar si no existe CurseForge.AppImage
+        if [ ! -f "CurseForge.AppImage" ]; then
+          echo "Procesando archivos de CurseForge..."
+          
+          # Buscar archivo AppImage
+          APPIMAGE_FILE=$(find . -name "*.AppImage" -type f | head -1)
+          if [ -n "$APPIMAGE_FILE" ] && [ "$APPIMAGE_FILE" != "./CurseForge.AppImage" ]; then
+            echo "Renombrando $APPIMAGE_FILE a CurseForge.AppImage"
+            mv "$APPIMAGE_FILE" CurseForge.AppImage
+            chmod +x CurseForge.AppImage
+          fi
+        else
+          echo "CurseForge.AppImage ya existe, omitiendo procesamiento"
+        fi
+        
+        # Limpiar archivos temporales
+        rm -f curseforge-linux.zip
+        
+        echo "Procesamiento completado"
+      when: 
+        - not curseforge_exists.stat.exists
+        - curseforge_download_main is succeeded
+      become_user: usuario
+      register: curseforge_process
+      changed_when: "'Procesando archivos' in curseforge_process.stdout"
+
+    - name: Extraer CurseForge AppImage (solución para problemas de FUSE)
+      shell: |
+        cd {{ curseforge_dir }}
+        if [ -f "CurseForge.AppImage" ] && [ ! -d "extracted" ]; then
+          echo "Extrayendo AppImage para compatibilidad..."
+          ./CurseForge.AppImage --appimage-extract >/dev/null 2>&1
+          if [ -d "squashfs-root" ]; then
+            mv squashfs-root extracted
+            chmod +x extracted/AppRun
+            chmod +x extracted/curseforge 2>/dev/null || true
+            echo "Extracción completada"
+          fi
+        else
+          echo "AppImage ya extraído o no disponible"
+        fi
+      when: 
+        - not curseforge_exists.stat.exists
+        - curseforge_download_main is succeeded
+      become_user: usuario
+      register: curseforge_extract
+      changed_when: "'Extrayendo AppImage' in curseforge_extract.stdout"
+
+    - name: Crear script de lanzamiento inteligente para CurseForge
+      copy:
+        content: |
+          #!/bin/bash
+          
+          cd {{ curseforge_dir }}
+          
+          # Función para mostrar error
+          show_error() {
+            echo "❌ Error al ejecutar CurseForge: $1"
+            echo ""
+            echo "💡 Soluciones posibles:"
+            echo "1. Instalar FUSE: sudo apt install fuse libfuse2"
+            echo "2. Añadir usuario a grupo fuse: sudo usermod -a -G fuse $USER"
+            echo "3. Reiniciar sesión después de los cambios"
+            echo "4. Descargar manualmente desde: https://www.curseforge.com/download/app"
+            read -p "Presiona Enter para continuar..."
+          }
+          
+          # Verificar si existe el AppImage
+          if [ ! -f "CurseForge.AppImage" ]; then
+            show_error "CurseForge no está instalado"
+            exit 1
+          fi
+          
+          echo "🚀 Iniciando CurseForge..."
+          
+          # Método 1: Intentar ejecutar AppImage directamente
+          if ./CurseForge.AppImage 2>/dev/null; then
+            exit 0
+          fi
+          
+          echo "⚠️  Problema con FUSE detectado, intentando método alternativo..."
+          
+          # Método 2: Usar versión extraída si existe
+          if [ -f "extracted/AppRun" ]; then
+            echo "🔄 Ejecutando versión extraída..."
+            cd extracted
+            ./AppRun
+            exit 0
+          fi
+          
+          # Método 3: Extraer y ejecutar
+          echo "🔄 Extrayendo AppImage..."
+          if ./CurseForge.AppImage --appimage-extract >/dev/null 2>&1; then
+            if [ -d "squashfs-root" ]; then
+              mv squashfs-root extracted
+              chmod +x extracted/AppRun
+              echo "✅ Extracción completada, ejecutando..."
+              cd extracted
+              ./AppRun
+              exit 0
+            fi
+          fi
+          
+          # Si todo falla
+          show_error "No se pudo ejecutar con ningún método"
+        dest: "{{ curseforge_dir }}/launch_curseforge.sh"
+        owner: usuario
+        group: usuario
+        mode: '0755'
+
+    # ================================
+    # ACCESOS DIRECTOS Y CONFIGURACIÓN
+    # ================================
+
+    - name: Crear acceso directo de TLauncher en el escritorio
       copy:
         content: |
           [Desktop Entry]
@@ -102,8 +348,8 @@
           Type=Application
           Name=TLauncher
           Comment=Minecraft Launcher
-          Exec={{ launcher_dir }}/launch.sh
-          Icon={{ launcher_dir }}/icon.png
+          Exec={{ launcher_dir }}/launch_tlauncher.sh
+          Icon=applications-games
           Terminal=false
           StartupNotify=true
           Categories=Game;
@@ -111,35 +357,154 @@
         owner: usuario
         group: usuario
         mode: '0755'
-      ignore_errors: yes
 
-    - name: Verificar instalación
+    - name: Crear acceso directo de CurseForge en el escritorio
+      copy:
+        content: |
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=CurseForge
+          Comment=Minecraft Mod Manager
+          Exec={{ curseforge_dir }}/launch_curseforge.sh
+          Icon=applications-games
+          Terminal=false
+          StartupNotify=true
+          Categories=Game;
+        dest: /home/usuario/Desktop/CurseForge.desktop
+        owner: usuario
+        group: usuario
+        mode: '0755'
+
+    - name: Crear script maestro para lanzar ambos launchers
+      copy:
+        content: |
+          #!/bin/bash
+          
+          # Colores para output
+          GREEN='\033[0;32m'
+          BLUE='\033[0;34m'
+          YELLOW='\033[1;33m'
+          NC='\033[0m'
+          
+          clear
+          echo -e "${BLUE}================================${NC}"
+          echo -e "${BLUE}    SMAI CLIENT LAUNCHERS${NC}"
+          echo -e "${BLUE}================================${NC}"
+          echo ""
+          
+          # Verificar instalaciones
+          TLAUNCHER_OK=false
+          CURSEFORGE_OK=false
+          
+          if [ -f "{{ launcher_dir }}/TLauncher.jar" ]; then
+            TLAUNCHER_OK=true
+            echo -e "1) TLauncher ${GREEN}✅ DISPONIBLE${NC}"
+          else
+            echo -e "1) TLauncher ${YELLOW}❌ NO DISPONIBLE${NC}"
+          fi
+          
+          if [ -f "{{ curseforge_dir }}/CurseForge.AppImage" ]; then
+            CURSEFORGE_OK=true
+            echo -e "2) CurseForge ${GREEN}✅ DISPONIBLE${NC}"
+          else
+            echo -e "2) CurseForge ${YELLOW}❌ NO DISPONIBLE${NC}"
+          fi
+          
+          echo "3) Salir"
+          echo ""
+          read -p "Selecciona una opción: " choice
+          
+          case $choice in
+              1)
+                  if [ "$TLAUNCHER_OK" = true ]; then
+                    echo -e "${GREEN}Iniciando TLauncher...${NC}"
+                    cd {{ launcher_dir }}
+                    ./launch_tlauncher.sh
+                  else
+                    echo -e "${YELLOW}TLauncher no está disponible${NC}"
+                    read -p "Presiona Enter para continuar..."
+                  fi
+                  ;;
+              2)
+                  if [ "$CURSEFORGE_OK" = true ]; then
+                    echo -e "${GREEN}Iniciando CurseForge...${NC}"
+                    cd {{ curseforge_dir }}
+                    ./launch_curseforge.sh
+                  else
+                    echo -e "${YELLOW}CurseForge no está disponible${NC}"
+                    echo "Descárgalo desde: https://www.curseforge.com/download/app"
+                    read -p "Presiona Enter para continuar..."
+                  fi
+                  ;;
+              3)
+                  echo "¡Hasta luego!"
+                  exit 0
+                  ;;
+              *)
+                  echo "Opción inválida"
+                  read -p "Presiona Enter para continuar..."
+                  ;;
+          esac
+        dest: /home/usuario/smai/launch_minecraft.sh
+        owner: usuario
+        group: usuario
+        mode: '0755'
+
+    - name: Crear acceso directo del launcher maestro
+      copy:
+        content: |
+          [Desktop Entry]
+          Version=1.0
+          Type=Application
+          Name=SMAI Minecraft Launchers
+          Comment=Seleccionar launcher de Minecraft
+          Exec=gnome-terminal -- /home/usuario/smai/launch_minecraft.sh
+          Icon=applications-games
+          Terminal=true
+          StartupNotify=true
+          Categories=Game;
+        dest: /home/usuario/Desktop/SMAI-Launchers.desktop
+        owner: usuario
+        group: usuario
+        mode: '0755'
+
+    # ================================
+    # VERIFICACIÓN FINAL Y REPORTE
+    # ================================
+
+    - name: Verificar instalación final de TLauncher
       stat:
         path: "{{ launcher_dir }}/TLauncher.jar"
-      register: final_check
+      register: tlauncher_final_check
 
-    - name: Mostrar información de instalación
+    - name: Verificar instalación final de CurseForge
+      stat:
+        path: "{{ curseforge_dir }}/CurseForge.AppImage"
+      register: curseforge_final_check
+
+    - name: Mostrar resumen final de instalación
       debug:
         msg: |
           ================================
-          TLauncher instalado exitosamente!
+          🎮 SMAI CLIENT INSTALADO EXITOSAMENTE! 🎮
           ================================
-          Ubicación: {{ launcher_dir }}
           
-          Para ejecutar TLauncher:
-          cd {{ launcher_dir }}
-          ./launch.sh
+          📊 ESTADO DE INSTALACIÓN:
+          TLauncher: {{ 'INSTALADO ✅' if tlauncher_final_check.stat.exists else 'ERROR ❌' }}
+          CurseForge: {{ 'INSTALADO ✅' if curseforge_final_check.stat.exists else 'NO INSTALADO ⚠️' }}
           
-          O usar el acceso directo del escritorio
+          🚀 COMANDOS PARA USAR:
+          
+          # Launcher maestro (recomendado):
+          /home/usuario/smai/launch_minecraft.sh
+          
+          # TLauncher directo:
+          {{ launcher_dir }}/launch_tlauncher.sh
+          
+          # CurseForge directo:
+          {{ curseforge_dir }}/launch_curseforge.sh
+          
+          📁 ACCESOS DIRECTOS creados en el escritorio
+          
           ================================
-      when: final_check.stat.exists
-
-    - name: Mostrar error si la instalación falló
-      debug:
-        msg: |
-          ================================
-          Error en la instalación de TLauncher
-          ================================
-          Verifica manualmente en {{ launcher_dir }}
-          ================================
-      when: not final_check.stat.exists

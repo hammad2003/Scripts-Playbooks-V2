@@ -117,20 +117,61 @@ setup_ansible() {
     configurar_ansible
 }
 
-# Función para agregar servidor al archivo de hosts de Ansible si no existe
+# Función mejorada para agregar servidor al archivo de hosts de Ansible
 add_to_ansible_hosts() {
     local server_type=$1
     local ip_address=$2
     
-    if ! grep -q "$ip_address" /etc/ansible/hosts; then
-        log "Agregando $ip_address como $server_type a Ansible hosts"
+    log "Verificando configuración de Ansible hosts para $server_type..."
+    
+    # Verificar si la sección existe
+    if ! grep -q "^\[$server_type\]" /etc/ansible/hosts; then
+        log "Creando sección [$server_type] en Ansible hosts"
         {
             echo ""
             echo "[$server_type]"
             echo "$ip_address"
         } | sudo tee -a /etc/ansible/hosts > /dev/null
     else
-        log "$ip_address ya está en el archivo hosts de Ansible"
+        # Verificar si la IP ya está en la sección
+        if ! sed -n "/^\[$server_type\]/,/^\[/p" /etc/ansible/hosts | grep -q "$ip_address"; then
+            log "Agregando $ip_address a la sección [$server_type]"
+            # Insertar la IP después de la línea de la sección
+            sudo sed -i "/^\[$server_type\]/a $ip_address" /etc/ansible/hosts
+        else
+            log "$ip_address ya está en la sección [$server_type]"
+        fi
+    fi
+    
+    # Verificar que se añadió correctamente
+    if grep -A 5 "^\[$server_type\]" /etc/ansible/hosts | grep -q "$ip_address"; then
+        log "✅ IP $ip_address añadida correctamente a [$server_type]"
+        return 0
+    else
+        error "❌ Error al añadir IP $ip_address a [$server_type]"
+        return 1
+    fi
+}
+
+# Nueva función para preparar Ansible antes de ejecutar playbooks
+prepare_ansible_host() {
+    local server_type=$1
+    local ip_address=$(hostname -I | cut -d ' ' -f1)
+    
+    log "Preparando configuración de Ansible para $server_type..."
+    
+    # Añadir la IP al archivo hosts
+    if add_to_ansible_hosts "$server_type" "$ip_address"; then
+        log "Configuración de Ansible lista para $server_type"
+        
+        # Mostrar configuración actual para debug
+        log "Configuración actual de /etc/ansible/hosts:"
+        sudo cat /etc/ansible/hosts | tail -10
+        
+        return 0
+    else
+        error "Error al configurar Ansible hosts"
+        return 1
     fi
 }
 
@@ -189,33 +230,43 @@ main() {
         
         case $CHOICE in
             1)
-                log "Instalando TLauncher (Cliente)..."
-                if [ -f "install_client.sh" ]; then
-                    chmod +x install_client.sh
-                    ./install_client.sh
-                    if [ $? -eq 0 ]; then
-                        add_to_ansible_hosts "clientes" "$(hostname -I | cut -d ' ' -f1)"
-                        whiptail --title "Éxito" --msgbox "Cliente instalado correctamente!" 8 45
+                log "Preparando instalación de TLauncher (Cliente)..."
+        
+                # Preparar Ansible antes de ejecutar
+                if prepare_ansible_host "clientes"; then
+                    if [ -f "install_client.sh" ]; then
+                        chmod +x install_client.sh
+                        ./install_client.sh
+                        if [ $? -eq 0 ]; then
+                            whiptail --title "Éxito" --msgbox "Cliente instalado correctamente!" 8 45
+                        else
+                            whiptail --title "Error" --msgbox "Error al instalar el cliente!" 8 45
+                        fi
                     else
-                        whiptail --title "Error" --msgbox "Error al instalar el cliente!" 8 45
+                        whiptail --title "Error" --msgbox "install_client.sh not found!" 8 45
                     fi
                 else
-                    whiptail --title "Error" --msgbox "install_client.sh not found!" 8 45
+                    whiptail --title "Error" --msgbox "Error al configurar Ansible para cliente!" 8 45
                 fi
                 ;;
             2)
-                log "Instalando SMAI (Servidores de Minecraft Automatizados Increíbles)..."
-                if [ -f "install_server.sh" ]; then
-                    chmod +x install_server.sh
-                    ./install_server.sh
-                    if [ $? -eq 0 ]; then
-                        add_to_ansible_hosts "servidor" "$(hostname -I | cut -d ' ' -f1)"
-                        whiptail --title "Éxito" --msgbox "Servidor instalado correctamente!" 8 45
+                log "Preparando instalación de SMAI (Servidor)..."
+        
+                # Preparar Ansible antes de ejecutar
+                if prepare_ansible_host "servidor"; then
+                    if [ -f "install_server.sh" ]; then
+                        chmod +x install_server.sh
+                        ./install_server.sh
+                        if [ $? -eq 0 ]; then
+                            whiptail --title "Éxito" --msgbox "Servidor instalado correctamente!" 8 45
+                        else
+                            whiptail --title "Error" --msgbox "Error al instalar el servidor!" 8 45
+                        fi
                     else
-                        whiptail --title "Error" --msgbox "Error al instalar el servidor!" 8 45
+                        whiptail --title "Error" --msgbox "install_server.sh not found!" 8 45
                     fi
                 else
-                    whiptail --title "Error" --msgbox "install_server.sh not found!" 8 45
+                    whiptail --title "Error" --msgbox "Error al configurar Ansible para servidor!" 8 45
                 fi
                 ;;
             3)
